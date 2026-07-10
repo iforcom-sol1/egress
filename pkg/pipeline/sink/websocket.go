@@ -90,8 +90,14 @@ func newWebsocketSink(
 				return gst.FlowOK
 			}
 
-			// map the buffer to READ operation
+			// map the buffer to READ operation. MapInfo.Bytes copies the mapped
+			// memory, so the buffer can be unmapped as soon as the copy is made.
+			// gst_buffer_map takes a reference on the underlying GstMemory which
+			// is only released by gst_buffer_unmap - without it, every sample's
+			// payload leaks (~190KiB/s for 48kHz stereo s16le) until the handler
+			// is OOM killed.
 			samples := buffer.Map(gst.MapRead).Bytes()
+			buffer.Unmap()
 
 			// send to writer
 			_, err = websocketSink.Write(samples)
