@@ -54,6 +54,19 @@ const (
 	flushingThreshold = 100
 	// Maximum number of source bin resets per writer lifetime.
 	maxSrcResets = 2
+
+	// Stale backlog recovery: when the source branch falls behind the pipeline
+	// clock (e.g. audio resuming after a long mute while the audiotestsrc branch
+	// kept the mixer's output position advancing), buffers queued between the
+	// appsrc and the mixer only drain at 1x speed, so every packet reaches
+	// GetPTS older than oldPacketThreshold and is dropped - a self-sustaining
+	// stall that the discontinuity flush can never fix, because GetPTS drops
+	// the packet before the discontinuity check runs. Flushing the source bin
+	// discards that backlog so fresh packets can flow again. The threshold
+	// (~200ms of 20ms audio packets) avoids flushing on isolated late packets.
+	staleDropFlushThreshold = 10
+	// Minimum interval between stale backlog flushes.
+	staleFlushMinInterval = 2 * time.Second
 )
 
 var errFlowFlushingThreshold = errors.New("persistent FlowFlushing detected")
@@ -118,6 +131,10 @@ type AppWriter struct {
 	// FlowFlushing recovery
 	flushingCount int // consecutive FlowFlushing returns from PushBuffer
 	srcResetCount int // number of source bin resets performed
+
+	// stale backlog recovery (see staleDropFlushThreshold)
+	consecutiveOldDrops int       // consecutive ErrPacketTooOld drops from GetPTS
+	lastStaleFlush      time.Time // last time the source bin was flushed to clear a stale backlog
 
 	// diagnostics, set on unexpected flushing when pushing packets to the pipeline
 	flushDotRequested atomic.Bool
@@ -543,8 +560,13 @@ func (w *AppWriter) pushPacket(pkt jitter.ExtPacket) error {
 	pts, err := w.GetPTS(pkt)
 	if err != nil {
 		w.stats.packetsDropped.Inc()
+		if utils.ErrorIsOneOf(err, synchronizer.ErrPacketTooOld) {
+			w.consecutiveOldDrops++
+			w.maybeFlushStaleBacklog()
+		}
 		return err
 	}
+	w.consecutiveOldDrops = 0
 
 	if pts < 0 {
 		// TODO: handle it by sending new gst segment that will reflect the offset
@@ -771,6 +793,35 @@ func (w *AppWriter) updateDrift(drift time.Duration) {
 
 func (w *AppWriter) shouldHandleDiscontinuity() bool {
 	return w.track.Kind() == webrtc.RTPCodecTypeAudio && w.conf.AudioTempoController.Enabled
+}
+
+// maybeFlushStaleBacklog recovers from a stale packet backlog (see
+// staleDropFlushThreshold). It flushes the source bin so queued buffers are
+// discarded and fresh packets can reach the mixer without inheriting the
+// backlog's delay. Gated on the same condition as the discontinuity flush.
+func (w *AppWriter) maybeFlushStaleBacklog() {
+	if !w.shouldHandleDiscontinuity() {
+		return
+	}
+	if w.consecutiveOldDrops < staleDropFlushThreshold {
+		return
+	}
+	if now := time.Now(); now.Sub(w.lastStaleFlush) < staleFlushMinInterval {
+		return
+	} else {
+		w.lastStaleFlush = now
+	}
+
+	w.logger.Infow("stale packet backlog detected, flushing source bin",
+		"consecutiveOldDrops", w.consecutiveOldDrops,
+		"lastPTS", w.lastPTS,
+	)
+	if ok := w.src.SendEvent(gst.NewFlushStartEvent()); !ok {
+		w.logger.Errorw("failed to send flush start event", nil)
+	}
+	if ok := w.src.SendEvent(gst.NewFlushStopEvent(false)); !ok {
+		w.logger.Errorw("failed to send flush stop event", nil)
+	}
 }
 
 func (w *AppWriter) TrackKind() webrtc.RTPCodecType {
