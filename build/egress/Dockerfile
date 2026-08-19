@@ -26,9 +26,9 @@ ENV TARGETPLATFORM=${TARGETPLATFORM}
 WORKDIR /workspace
 
 # install go
-RUN wget https://go.dev/dl/go1.26.2.linux-${TARGETARCH}.tar.gz && \
+RUN wget https://go.dev/dl/go1.26.6.linux-${TARGETARCH}.tar.gz && \
     rm -rf /usr/local/go && \
-    tar -C /usr/local -xzf go1.26.2.linux-${TARGETARCH}.tar.gz
+    tar -C /usr/local -xzf go1.26.6.linux-${TARGETARCH}.tar.gz
 ENV PATH="/usr/local/go/bin:${PATH}"
 
 # download go modules
@@ -60,7 +60,13 @@ FROM livekit/gstreamer:1.24.12-prod
 ARG TARGETPLATFORM
 
 # install deps
+#
+# The apt-get upgrade is fork-specific.  The base image ships Ubuntu 24.04
+# packages (openssl / libssl3t64 / libtiff6) that lag the security pocket, and
+# Trivy flags them on the published image.  GStreamer itself is built from
+# source under /usr/local by the base image, so apt updates do not touch it.
 RUN apt-get update && \
+    apt-get upgrade -y && \
     apt-get install -y \
     curl \
     fonts-noto \
